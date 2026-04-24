@@ -7,23 +7,26 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 import HTMRL.spatial_pooler as spatial_pooler
 import HTMRL.temporal_memory as temporal_memory
 
-from HTMRL.encoders import ScalarEncoder, CyclicEncoder, GeospatialEncoder
+from HTMRL.encoders import ScalarEncoder, CyclicEncoder, TileGeospatialEncoder
 from HTMRL.decoders import action_decode
 
-# Input Size = 100 (My Ships) + 200 (Enemy Planets) + 200 (Neutral Planets) + 200 (Friendly Planets) + 200 (Enemy Fleets) + 200 (Friendly Fleets)
-INPUT_SIZE = 1100
+# 2.5% Sparsity rule
+# My Ships: Size 1000, Active 25 (2.5%)
+# Channels: 5 channels * 2000 size (50 active, 2.5%) = 10,000
+# Total INPUT_SIZE = 11000
+INPUT_SIZE = 11000
 
 class OrbitWarsEncoder:
     def __init__(self):
         self.size = INPUT_SIZE
-        self.ships_encoder = ScalarEncoder(100, 21, 0, 500)
-        self.geo_encoder = GeospatialEncoder(200)
+        self.ships_encoder = ScalarEncoder(1000, 25, 0, 500)
+        self.geo_encoder = TileGeospatialEncoder(2000, 50)
 
     def encode(self, my_planet, planets, fleets, player):
         state = np.zeros(self.size, dtype=bool)
         
         # 1. My ships
-        state[0:100] = self.ships_encoder.encode(my_planet.ships)
+        state[0:1000] = self.ships_encoder.encode(my_planet.ships)
 
         # 2. Separate entities
         enemy_planets = [p for p in planets if p.owner != player and p.owner != -1 and p.id != my_planet.id]
@@ -33,17 +36,17 @@ class OrbitWarsEncoder:
         enemy_fleets = [f for f in fleets if f.owner != player]
         friendly_fleets = [f for f in fleets if f.owner == player]
 
-        # 3. Encode unions
-        offset = 100
-        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, enemy_planets)
-        offset += 200
-        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, neutral_planets)
-        offset += 200
-        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, friendly_planets)
-        offset += 200
-        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, enemy_fleets)
-        offset += 200
-        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, friendly_fleets)
+        # 3. Encode Top-K Unions
+        offset = 1000
+        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_planets)
+        offset += 2000
+        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, neutral_planets)
+        offset += 2000
+        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_planets)
+        offset += 2000
+        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_fleets)
+        offset += 2000
+        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_fleets)
         
         return state
 def encoding_to_action(encoding, actions, sp_size):

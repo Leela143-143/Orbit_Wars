@@ -33,9 +33,9 @@ HTMRL/
 ### 1. State Encoding
 The game state is encoded dynamically from the perspective of each planet using overlapping **Sparse Distributed Representations (SDRs)** to preserve semantic similarity. The encoders are located in `HTMRL/encoders.py`.
 
-The state size is 1100 bits:
-- **My Ships (100 bits):** Encoded using an overlapping `ScalarEncoder`. Similar ship counts share active bits.
-- **Union of Geospatial SDRs (200 bits each):** For Enemy Planets, Neutral Planets, Friendly Planets, Enemy Fleets, and Friendly Fleets.
+The state size is 11000 bits:
+- **My Ships (1000 bits):** Encoded using an overlapping `ScalarEncoder`. Similar ship counts share active bits.
+- **Union of Geospatial SDRs (2000 bits each):** For Enemy Planets, Neutral Planets, Friendly Planets, Enemy Fleets, and Friendly Fleets.
 - A `GeospatialEncoder` translates distance and angle of an entity relative to the planet into a sparse representation. By applying a **bitwise OR (Union)** across all entities of a given type, the agent handles a variable number of planets/fleets seamlessly without sorting or changing the input array size.
 
 ### 2. Spatial Pooler

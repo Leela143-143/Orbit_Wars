@@ -185,7 +185,7 @@ class TemporalMemory(object):
         count = min(len(unconnected), count)
         # Pick targets at random
         #for ind in np.random.choice(unconnected, count):
-        for ind in random.sample(unconnected, count):
+        for ind in random.sample(list(unconnected), count):
             # Store where to grow to, actually grow them all together later on for efficiency
             self.permanence_updates_buffer[0].append(initial_perm)
             self.permanence_updates_buffer[1].append(idx_toseg)

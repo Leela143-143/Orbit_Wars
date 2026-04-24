@@ -11,44 +11,46 @@ import HTMRL.temporal_memory as temporal_memory
 NUM_ACTIONS = 25
 INPUT_SIZE = 40  # 12 enemy, 12 neutral, 12 friendly sectors + 4 ship bins
 
-class OrbitWarsEncoder:
-    def __init__(self, size=INPUT_SIZE):
-        self.size = size
 
-    def encode(self, my_planet, planets, player):
-        # State array:
-        # 0-11: Enemy in sector (12 directional slices)
-        # 12-23: Neutral in sector
-        # 24-35: Friendly in sector
-        # 36-39: My ships (discretized to 4 bins)
-        
+from HTMRL.encoders import ScalarEncoder, CyclicEncoder, GeospatialEncoder
+from HTMRL.decoders import action_decode
+
+# Input Size = 100 (My Ships) + 200 (Enemy Planets) + 200 (Neutral Planets) + 200 (Friendly Planets) + 200 (Enemy Fleets) + 200 (Friendly Fleets)
+INPUT_SIZE = 1100
+
+class OrbitWarsEncoder:
+    def __init__(self):
+        self.size = INPUT_SIZE
+        self.ships_encoder = ScalarEncoder(100, 21, 0, 500)
+        self.geo_encoder = GeospatialEncoder(200)
+
+    def encode(self, my_planet, planets, fleets, player):
         state = np.zeros(self.size, dtype=bool)
         
-        # Discretize our ships into 4 bins (e.g. 0-25, 26-50, 51-75, 75+)
-        ships_idx = min(3, int(my_planet.ships / 25))
-        state[36 + ships_idx] = True
-        
-        for p in planets:
-            if p.id == my_planet.id:
-                continue
-                
-            # Calculate angle from our planet to the other planet
-            angle = math.atan2(p.y - my_planet.y, p.x - my_planet.x)
-            if angle < 0:
-                angle += 2 * math.pi
-                
-            # Map angle to one of the 12 sectors
-            sector = int((angle / (2 * math.pi)) * 12) % 12
-            
-            if p.owner == -1:
-                state[12 + sector] = True
-            elif p.owner == player:
-                state[24 + sector] = True
-            else:
-                state[sector] = True
-                
-        return state
+        # 1. My ships
+        state[0:100] = self.ships_encoder.encode(my_planet.ships)
 
+        # 2. Separate entities
+        enemy_planets = [p for p in planets if p.owner != player and p.owner != -1 and p.id != my_planet.id]
+        neutral_planets = [p for p in planets if p.owner == -1 and p.id != my_planet.id]
+        friendly_planets = [p for p in planets if p.owner == player and p.id != my_planet.id]
+
+        enemy_fleets = [f for f in fleets if f.owner != player]
+        friendly_fleets = [f for f in fleets if f.owner == player]
+
+        # 3. Encode unions
+        offset = 100
+        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, enemy_planets)
+        offset += 200
+        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, neutral_planets)
+        offset += 200
+        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, friendly_planets)
+        offset += 200
+        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, enemy_fleets)
+        offset += 200
+        state[offset:offset+200] = self.geo_encoder.encode_union(my_planet.x, my_planet.y, friendly_fleets)
+        
+        return state
 def encoding_to_action(encoding, actions, sp_size):
     buckets = np.floor(encoding / (float(sp_size) / actions))
     buckets = buckets.astype(np.int32)
@@ -57,7 +59,7 @@ def encoding_to_action(encoding, actions, sp_size):
 
 class HTMRLAgent:
     def __init__(self, load_path=None):
-        self.encoder = OrbitWarsEncoder(INPUT_SIZE)
+        self.encoder = OrbitWarsEncoder()
         if load_path and os.path.exists(load_path):
             with open(load_path, "rb") as f:
                 data = pickle.load(f)
@@ -70,7 +72,7 @@ class HTMRLAgent:
         else:
             self.sp = spatial_pooler.SpatialPooler(
                 input_size=(INPUT_SIZE,), 
-                acts_n=NUM_ACTIONS,
+                acts_n=1,
                 cell_count=2048,
                 active_count=40
             )
@@ -85,7 +87,10 @@ class HTMRLAgent:
         player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
         step = obs.get("step", 0) if isinstance(obs, dict) else getattr(obs, "step", 0)
         raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
+        raw_fleets = obs.get("fleets", []) if isinstance(obs, dict) else getattr(obs, "fleets", [])
         planets = [Planet(*p) for p in raw_planets]
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
+        fleets = [Fleet(*f) for f in raw_fleets]
         
         # Clear local timeline memory when a new match starts
         if step == 0:
@@ -119,7 +124,7 @@ class HTMRLAgent:
         self.last_states = {}
 
         for mine in my_planets:
-            state = self.encoder.encode(mine, planets, player)
+            state = self.encoder.encode(mine, planets, fleets, player)
             sp_active_cols = self.sp.step(state, learn=False) # We'll do manual learning above
             
             if mine.id not in self.tm_states:
@@ -150,30 +155,25 @@ class HTMRLAgent:
             for k in self.tm_states[mine.id].keys():
                 self.tm_states[mine.id][k] = getattr(self.tm, k)
             
+
             if tm_actives.nnz > 0:
-                action = encoding_to_action(tm_actives.indices, NUM_ACTIONS, self.tm_size)
+                angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
             else:
-                action = encoding_to_action(sp_active_cols, NUM_ACTIONS, self.sp.size)
+                angle, ship_pct = action_decode(sp_active_cols, self.sp.size, num_cells=None)
             
             self.last_states[mine.id] = state
-            self.last_actions[mine.id] = action
+            # For learning we only pass action 0 since we have acts_n=1
+            self.last_actions[mine.id] = 0
             
-            # Execute action based on the 25 directional sectors
-            if action == 0:
+            # ship_pct is continuous between 0 and 1
+            # If ship_pct < 0.1, we consider it a "do nothing" threshold
+            if ship_pct < 0.1:
                 continue
                 
-            # Actions 1 to 12 map to 50% ships, 13 to 24 map to 100% ships
-            if action <= 12:
-                ships = max(1, int(mine.ships * 0.5))
-                sector = action - 1
-            else:
-                ships = mine.ships
-                sector = action - 13
-                
-            # Convert sector back to angle in radians
-            angle = (sector * (2 * math.pi / 12))
+            ships = max(1, int(mine.ships * ship_pct))
             
             moves.append([mine.id, angle, ships])
+
                 
         return moves
 

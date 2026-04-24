@@ -156,6 +156,7 @@ class HTMRLAgent:
                 self.tm_states[mine.id][k] = getattr(self.tm, k)
             
 
+
             if tm_actives.nnz > 0:
                 angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
             else:
@@ -166,13 +167,16 @@ class HTMRLAgent:
             self.last_actions[mine.id] = 0
             
             # ship_pct is continuous between 0 and 1
-            # If ship_pct < 0.1, we consider it a "do nothing" threshold
-            if ship_pct < 0.1:
+            # If ship_pct < 0.1 or we have no ships, do nothing
+            if ship_pct < 0.1 or mine.ships == 0:
                 continue
                 
-            ships = max(1, int(mine.ships * ship_pct))
+            ships = int(mine.ships * ship_pct)
+            if ships == 0:
+                continue
             
             moves.append([mine.id, angle, ships])
+
 
                 
         return moves

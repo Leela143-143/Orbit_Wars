@@ -29,23 +29,24 @@ HTMRL/
 ## How It Works
 
 ### 1. State Encoding
-Each planet's local view is encoded into a **40-bit binary vector**:
-- Bits 0–11: Enemy planets in each of 12 directional sectors
-- Bits 12–23: Neutral planets per sector
-- Bits 24–35: Friendly planets per sector
-- Bits 36–39: Own ship count (discretized into 4 bins)
+The game state is encoded dynamically from the perspective of each planet using overlapping **Sparse Distributed Representations (SDRs)** to preserve semantic similarity. The encoders are located in `HTMRL/encoders.py`.
+
+The state size is 1100 bits:
+- **My Ships (100 bits):** Encoded using an overlapping `ScalarEncoder`. Similar ship counts share active bits.
+- **Union of Geospatial SDRs (200 bits each):** For Enemy Planets, Neutral Planets, Friendly Planets, Enemy Fleets, and Friendly Fleets.
+- A `GeospatialEncoder` translates distance and angle of an entity relative to the planet into a sparse representation. By applying a **bitwise OR (Union)** across all entities of a given type, the agent handles a variable number of planets/fleets seamlessly without sorting or changing the input array size.
 
 ### 2. Spatial Pooler
-The binary observation is fed through a **Spatial Pooler** that produces a **Sparse Distributed Representation (SDR)** — a small set of active columns from a 2048-column pool. This provides noise robustness and semantic similarity.
+The binary observation is fed through a **Spatial Pooler** that produces an SDR — a small set of active columns from a 2048-column pool. This provides noise robustness and semantic similarity.
 
 ### 3. Temporal Memory (per-planet timelines)
 Each planet maintains its **own temporal context** (`tm_states` dictionary). The Temporal Memory module learns sequential patterns by maintaining predictive cell states, enabling the agent to anticipate future game states.
 
 ### 4. Action Selection
-The active SDR columns are mapped to one of **25 discrete actions**:
-- `0`: Do nothing
-- `1–12`: Send 50% of ships in one of 12 angular directions
-- `13–24`: Send 100% of ships in one of 12 angular directions
+Instead of discrete categories, the active SDR columns are mapped back to continuous values using reverse decoders located in `HTMRL/decoders.py`:
+- **Reverse Cyclic Decoder:** Finds the circular center-of-mass of the first half of the active SDR to calculate the exact angle (0 to 2π).
+- **Reverse Scalar Decoder:** Finds the center-of-mass of the second half of the active SDR to calculate the fraction (0.0 to 1.0) of ships to launch.
+This guarantees the agent never tries to deploy more ships than the planet currently holds, since `ships_to_send = int(current_ships * fraction)`.
 
 ### 5. Population Training
 `train.py` runs **ELO-rated self-play** across a population of 100 bots:

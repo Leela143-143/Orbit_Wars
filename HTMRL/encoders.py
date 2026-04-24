@@ -45,46 +45,25 @@ class CyclicEncoder:
             state[idx] = True
         return state
 
-class HashGeospatialEncoder:
-    """
-    Encodes relative coordinates into an SDR using deterministic hashing.
-    Generates a unique but continuous spatial representation.
-    """
-    def __init__(self, size=2000, active_bits=50, grid_resolution=1.0):
-        self.size = size
-        self.active_bits = active_bits
-        self.grid_resolution = grid_resolution
-
-    def encode(self, dx, dy):
-        # Snap to grid to create consistent overlapping regions
-        # Shift coordinate slightly based on bits to create overlap
-        state = np.zeros(self.size, dtype=bool)
-
-        # We need `active_bits` number of hash outputs.
-        # To ensure spatial overlap, we sample points within a radius.
-
-        # A simpler way to get spatial overlap with deterministic hashing is to
-        # use the coordinates directly to seed a random number generator, but
-        # since we want overlap for NEARBY locations, we encode the location
-        # as a combination of cyclic grid phases or overlapping tiles.
-
-        # The easiest approach for true continuous overlap without collision
-        # is translating dx, dy to angle and distance, and concatenating them.
-        # But for 2.5% sparsity in 2000 bits (50 active), we can use two 1000-bit encoders.
-        pass
-
-# Let's implement a clean 2D tile encoder.
 class TileGeospatialEncoder:
-    def __init__(self, size=2000, active_bits=50):
+    """
+    Splits the encoding space into distinct blocks (e.g. Angle and Distance).
+    """
+    def __init__(self, size=2000, active_bits=50, is_fleet=False):
         self.size = size
         self.active_bits = active_bits
+        self.is_fleet = is_fleet
 
-        # We divide size into 2 parts: Distance and Angle
-        # Distance: 1000 bits, 25 active (2.5%)
-        # Angle: 1000 bits, 25 active (2.5%)
-        # Concatenated size = 2000 bits, 50 active. Sparsity = 50/2000 = 2.5%
-        self.angle_encoder = CyclicEncoder(size // 2, active_bits // 2, 0, 2*math.pi)
-        self.dist_encoder = ScalarEncoder(size // 2, active_bits // 2, 0, 150) # Board diagonal is ~141
+        if self.is_fleet:
+            # Fleet: 4000 bits total, 100 active
+            # 1. Angle (1000 bits)
+            # 2. Distance (3000 bits)
+            self.angle_encoder = CyclicEncoder(1000, 25, 0, 2*math.pi)
+            self.dist_encoder = ScalarEncoder(3000, 75, 0, 150)
+        else:
+            # Planet: 2000 bits total, 50 active
+            self.angle_encoder = CyclicEncoder(1000, 25, 0, 2*math.pi)
+            self.dist_encoder = ScalarEncoder(1000, 25, 0, 150)
 
     def encode(self, dx, dy):
         dist = math.sqrt(dx**2 + dy**2)
@@ -94,6 +73,7 @@ class TileGeospatialEncoder:
 
         angle_sdr = self.angle_encoder.encode(angle)
         dist_sdr = self.dist_encoder.encode(dist)
+
         return np.concatenate((angle_sdr, dist_sdr))
 
     def encode_union_topk(self, origin_x, origin_y, targets):
@@ -118,14 +98,10 @@ class TileGeospatialEncoder:
         # Top-K Sparsified Union
         final_state = np.zeros(self.size, dtype=bool)
         if len(targets) > 0:
-            # Get indices of top K values
-            # If there are fewer than K non-zero values, just take all non-zero
             non_zero_count = np.count_nonzero(float_state)
             k = min(self.active_bits, non_zero_count)
             if k > 0:
                 top_k_indices = np.argpartition(float_state, -k)[-k:]
                 final_state[top_k_indices] = True
 
-        # If no targets exist, final_state is all 0s (0% sparsity).
-        # We can leave it as 0s.
         return final_state

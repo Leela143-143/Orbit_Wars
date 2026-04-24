@@ -11,16 +11,18 @@ from HTMRL.encoders import ScalarEncoder, CyclicEncoder, TileGeospatialEncoder
 from HTMRL.decoders import action_decode
 
 # 2.5% Sparsity rule
-# My Ships: Size 1000, Active 25 (2.5%)
-# Channels: 5 channels * 2000 size (50 active, 2.5%) = 10,000
-# Total INPUT_SIZE = 11000
-INPUT_SIZE = 11000
+# My Ships: Size 1000, Active 25
+# 3 Planet Channels: 2000 size (50 active) = 6,000
+# 2 Fleet Channels: 4000 size (100 active) = 8,000
+# Total INPUT_SIZE = 15000
+INPUT_SIZE = 15000
 
 class OrbitWarsEncoder:
     def __init__(self):
         self.size = INPUT_SIZE
         self.ships_encoder = ScalarEncoder(1000, 25, 0, 500)
-        self.geo_encoder = TileGeospatialEncoder(2000, 50)
+        self.geo_planet_encoder = TileGeospatialEncoder(2000, 50, is_fleet=False)
+        self.geo_fleet_encoder = TileGeospatialEncoder(4000, 100, is_fleet=True)
 
     def encode(self, my_planet, planets, fleets, player):
         state = np.zeros(self.size, dtype=bool)
@@ -38,15 +40,15 @@ class OrbitWarsEncoder:
 
         # 3. Encode Top-K Unions
         offset = 1000
-        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_planets)
         offset += 2000
-        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, neutral_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, neutral_planets)
         offset += 2000
-        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_planets)
         offset += 2000
-        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_fleets)
-        offset += 2000
-        state[offset:offset+2000] = self.geo_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_fleets)
+        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_fleets)
+        offset += 4000
+        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_fleets)
         
         return state
 def encoding_to_action(encoding, actions, sp_size):

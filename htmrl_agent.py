@@ -7,11 +7,6 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 import HTMRL.spatial_pooler as spatial_pooler
 import HTMRL.temporal_memory as temporal_memory
 
-# 25 actions: 0=Do nothing, 1-12=50% ships in 12 directions, 13-24=100% ships in 12 directions
-NUM_ACTIONS = 25
-INPUT_SIZE = 40  # 12 enemy, 12 neutral, 12 friendly sectors + 4 ship bins
-
-
 from HTMRL.encoders import ScalarEncoder, CyclicEncoder, GeospatialEncoder
 from HTMRL.decoders import action_decode
 

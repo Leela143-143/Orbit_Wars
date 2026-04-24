@@ -46,26 +46,9 @@ WEIGHTS_B64 = '{encoded_weights}'
     bot_code = bot_code.replace("import os", "import os" + injection)
 
     # Decompress before unpickling
-    old_load_logic = """        if load_path and os.path.exists(load_path):
-            with open(load_path, "rb") as f:
-                data = pickle.load(f)
-                if isinstance(data, dict) and "sp" in data:
-                    self.sp = data["sp"]
-                    self.tms = data.get("tms", {})
-                else:
-                    self.sp = data
-                    self.tms = {}"""
+    old_load_logic = """        if load_path and os.path.exists(load_path):\n            with open(load_path, "rb") as f:\n                self.sp = pickle.load(f)"""
                 
-    new_load_logic = """        if WEIGHTS_B64:
-            # Decompress and then unpickle using the custom unpickler
-            decompressed = zlib.decompress(base64.b64decode(WEIGHTS_B64))
-            data = CustomUnpickler(io.BytesIO(decompressed)).load()
-            if isinstance(data, dict) and "sp" in data:
-                self.sp = data["sp"]
-                self.tms = data.get("tms", {})
-            else:
-                self.sp = data
-                self.tms = {}"""
+    new_load_logic = """        if WEIGHTS_B64:\n            # Decompress and then unpickle using the custom unpickler\n            decompressed = zlib.decompress(base64.b64decode(WEIGHTS_B64))\n            self.sp = CustomUnpickler(io.BytesIO(decompressed)).load()"""
 
     bot_code = bot_code.replace(old_load_logic, new_load_logic)
     

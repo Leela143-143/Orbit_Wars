@@ -12,9 +12,11 @@ The agent combines a **Spatial Pooler** (for sparse encoding of game state) with
 HTMRL/
 ├── HTMRL/                      # Core HTM library
 │   ├── __init__.py
-│   ├── spatial_pooler.py       # Sparse Distributed Representation encoder
+│   ├── spatial_pooler.py       # Sparse Distributed Representation logic
 │   ├── temporal_memory.py      # Sequence learning via temporal context
-│   └── log.py                  # Logging utilities
+│   ├── log.py                  # Logging utilities
+│   ├── encoders.py             # SDR Encoders (Scalar, Cyclic, Geospatial)
+│   └── decoders.py             # Reverse Decoders for continuous action mapping
 │
 ├── htmrl_agent.py              # HTMRLAgent — game-aware agent wrapper
 ├── train.py                    # ELO-based self-play population training
@@ -109,8 +111,7 @@ Key constants in `htmrl_agent.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `INPUT_SIZE` | 40 | Observation encoding size |
-| `NUM_ACTIONS` | 25 | Action space size |
+| `INPUT_SIZE` | 1100 | Observation encoding size |
 | `cell_count` | 2048 | Spatial Pooler columns |
 | `active_count` | 40 | Active columns per SDR |
 

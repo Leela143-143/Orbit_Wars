@@ -24,8 +24,8 @@ class SpatialPooler:
         self.init_synapse_count = max(1, self.init_synapse_count)
         self.connected_perm_thresh = 0.5
 
-        self.perm_inc_step = 0.05
-        self.perm_dec_step = 0.0  # 05
+        self.perm_inc_step = 0.15
+        self.perm_dec_step = 0.02
         self.perm_min = 0.01
         self.perm_max = 1.01
 
@@ -36,7 +36,7 @@ class SpatialPooler:
 
         self.active_duty_cycles = np.zeros(self.size)
 
-        self.boost_strength = boost_strength
+        self.boost_strength = boost_strength * 2.0
         self.boost_factors = np.ones(self.size, dtype=np.float32)
         self.boost_anneal_until = boost_until  # 0#500000
         self.boost_strength_init = boost_strength

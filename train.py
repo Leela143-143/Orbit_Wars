@@ -18,8 +18,8 @@ finally:
     sys.stdout = _old_stdout
     sys.stderr = _old_stderr
 
-NUM_BOTS = 100
-MATCHES = 500
+NUM_BOTS = 20
+MATCHES = 2000
 
 class BotManager:
     def __init__(self, bot_id):

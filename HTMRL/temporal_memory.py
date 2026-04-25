@@ -6,17 +6,17 @@ import HTMRL.log as log
 import time
 cells_per_col = 32
 
-activation_thresh = 16
-initial_perm = 0.31
+activation_thresh = 10
+initial_perm = 0.38
 connected_perm = 0.4  # 0.5
-learning_thresh = 12
+learning_thresh = 8
 learning_enabled = True
 
-perm_inc_step = 0.01
+perm_inc_step = 0.05
 perm_dec_step = 0.001
 perm_dec_predict_step = 0.000#5
 # max_seg set very low right now: serious impact on performance; should autoscale internally
-max_segments_per_cell = 4
+max_segments_per_cell = 32
 max_synapses_per_segment = 32
 
 sp_size = (2048,)

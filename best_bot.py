@@ -388,7 +388,7 @@ class HTMRLAgent:
         else:
             self.sp = SpatialPooler(
                 input_size=(INPUT_SIZE,), 
-                acts_n=25,
+                acts_n=1,
                 cell_count=2048,
                 active_count=41
             )

@@ -8,6 +8,7 @@ import HTMRL.spatial_pooler as spatial_pooler
 import HTMRL.temporal_memory as temporal_memory
 
 from HTMRL.encoders import ScalarEncoder, CyclicEncoder, TileGeospatialEncoder
+from HTMRL.decoders import action_decode
 def encoding_to_action(encoding, actions, sp_size):
     buckets = np.floor(encoding / (float(sp_size) / actions))
     buckets = buckets.astype(np.int32)
@@ -77,7 +78,7 @@ class HTMRLAgent:
         else:
             self.sp = spatial_pooler.SpatialPooler(
                 input_size=(INPUT_SIZE,), 
-                acts_n=25,
+                acts_n=1,
                 cell_count=2048,
                 active_count=41
             )
@@ -163,24 +164,20 @@ class HTMRLAgent:
 
 
             if tm_actives.nnz > 0:
-                action = encoding_to_action(tm_actives.indices, 25, self.tm_size)
+                angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
             else:
-                action = encoding_to_action(sp_active_cols, 25, self.sp.size)
+                angle, ship_pct = action_decode(sp_active_cols, self.sp.size, num_cells=None)
             
             self.last_states[mine.id] = state
-            self.last_actions[mine.id] = action
+            self.last_actions[mine.id] = 0  # Reverted to 0 since action space is continuous and spatial pooler uses acts_n=1
             
-            if action == 0:
+            if ship_pct < 0.1 or mine.ships == 0:
+                continue
+
+            ships = int(mine.ships * ship_pct)
+            if ships == 0:
                 continue
                 
-            if action <= 12:
-                ships = max(1, int(mine.ships * 0.5))
-                sector = action - 1
-            else:
-                ships = mine.ships
-                sector = action - 13
-
-            angle = (sector * (2 * math.pi / 12))
             moves.append([mine.id, angle, ships])
 
 

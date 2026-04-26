@@ -84,7 +84,6 @@ class HTMRLAgent:
             )
             self.tm = temporal_memory.TemporalMemory()
         self.tm_size = 2048 * 32
-        self.tm_states = {}
         self.last_actions = {}
         self.last_states = {}
 
@@ -100,7 +99,7 @@ class HTMRLAgent:
         
         # Clear local timeline memory when a new match starts
         if step == 0:
-            self.tm_states = {}
+            self.tm.reset()
             
         my_planets = [p for p in planets if p.owner == player]
         enemies = [p for p in planets if p.owner != player and p.owner != -1]
@@ -133,36 +132,9 @@ class HTMRLAgent:
             state = self.encoder.encode(mine, planets, fleets, player)
             sp_active_cols = self.sp.step(state, learn=False) # We'll do manual learning above
             
-            if mine.id not in self.tm_states:
-                from scipy.sparse import csr_matrix
-                self.tm_states[mine.id] = {
-                    "actives": csr_matrix((1, 2048 * 32), dtype=bool),
-                    "winners": csr_matrix((1, 2048 * 32), dtype=bool),
-                    "active_segs": csr_matrix((2048, 32 * 4), dtype=bool),
-                    "matching_segs": csr_matrix((2048, 32 * 4), dtype=bool),
-                    "matches_per_col": np.zeros((2048,)),
-                    "actives_per_col": np.zeros((2048,)),
-                    "active_pot_counts": [0] * (2048 * 32 * 4),
-                    "actives_old_t": csr_matrix((1, 2048 * 32), dtype=bool).transpose().tocsr(),
-                    "actives_old_perms": [0.0] * (2048 * 32),
-                    "permanence_updates_buffer": [[], [], []],
-                    "active_updates_buffer": [[], []],
-                    "winner_updates_buffer": [[], []]
-                }
-                
-            # INJECT STATE
-            for k, v in self.tm_states[mine.id].items():
-                setattr(self.tm, k, v)
-                
             # STEP TM
             tm_actives = self.tm.step(sp_active_cols)
             
-            # EXTRACT STATE
-            for k in self.tm_states[mine.id].keys():
-                self.tm_states[mine.id][k] = getattr(self.tm, k)
-            
-
-
             if tm_actives.nnz > 0:
                 angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
             else:

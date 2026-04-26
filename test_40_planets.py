@@ -38,6 +38,20 @@ for i in range(40, 60):
     ]
     planets.append(p)
 
+# Generate massive fleet spam (Stress test for Late Game)
+for i in range(500):
+    owner = player if i % 2 == 0 else 1
+    f = [
+        1000 + i,      # id
+        owner,         # owner
+        200 + (i/10),  # x
+        200 - (i/10),  # y
+        math.pi / 4,   # angle
+        0,             # from planet id
+        50             # ships
+    ]
+    fleets.append(f)
+
 # Mock observation dictionary as kaggle-environments passes
 obs = {
     "step": 1,

@@ -123,14 +123,17 @@ class TemporalMemory(object):
         """
         minimum = max_segments_per_cell
         mins = []
+
+        base_idx = col * cells_per_col
         # Get all cells for which no cell with fewer segments exists for this col
         for i in range(cells_per_col):
-            this_len = self.seg_counts[to_flat_tm(col, i)]
+            this_len = self.seg_counts.get(base_idx + i, 0)
             if this_len == minimum:
                 mins.append(i)
             elif this_len < minimum:
                 minimum = this_len
                 mins = [i]
+
         # From those, pick one at random
         return random.choice(mins) if len(mins) else None
 
@@ -165,31 +168,23 @@ class TemporalMemory(object):
             return
 
         idx = to_flat_segments(col, cell, seg_idx)
-
         idx_toseg = self.seg_linkings[idx]
-        # Check which aren't grown yet
-        #unconnected = np.setdiff1d(self.winners.indices, self.seg_matrix.indices[
-        #                                                     self.seg_matrix.indptr[idx_toseg]:self.seg_matrix.indptr[
-        #                                                         idx_toseg + 1]])
-        seta = set(self.winners.indices)
-        setb = set(self.seg_matrix.indices[
-                                                             self.seg_matrix.indptr[idx_toseg]:self.seg_matrix.indptr[
-                                                                 idx_toseg + 1]])
-        unconnected = seta.difference(setb)
-        #assert unconnected.size == len(temp)
-        #if not unconnected.size:
-        if not len(unconnected):
-            # Nothing left to grow to
+
+        # Array difference avoids slow sets and random.sample
+        arr_a = self.winners.indices
+        arr_b = self.seg_matrix.indices[self.seg_matrix.indptr[idx_toseg]:self.seg_matrix.indptr[idx_toseg + 1]]
+        unconnected = np.setdiff1d(arr_a, arr_b, assume_unique=True)
+
+        if unconnected.size == 0:
             return
-        #count = min(unconnected.size, count)
-        count = min(len(unconnected), count)
-        # Pick targets at random
-        #for ind in np.random.choice(unconnected, count):
-        for ind in random.sample(list(unconnected), count):
-            # Store where to grow to, actually grow them all together later on for efficiency
-            self.permanence_updates_buffer[0].append(initial_perm)
-            self.permanence_updates_buffer[1].append(idx_toseg)
-            self.permanence_updates_buffer[2].append(ind)
+
+        count = min(unconnected.size, count)
+        inds = np.random.choice(unconnected, count, replace=False)
+
+        # Append in bulk
+        self.permanence_updates_buffer[0].extend([initial_perm] * count)
+        self.permanence_updates_buffer[1].extend([idx_toseg] * count)
+        self.permanence_updates_buffer[2].extend(inds.tolist())
 
     def burst(self, col):
         """
@@ -227,19 +222,22 @@ class TemporalMemory(object):
             seg_idx = to_flat_segments(col, winner_cell, learning_seg)
             seg_linked = self.seg_linkings[seg_idx]
             seg = self.seg_matrix.indices[self.seg_matrix.indptr[seg_linked]:self.seg_matrix.indptr[seg_linked + 1]]
-            # Find which synapses are connected to previously active cells (i.e., contributed to seg being matching)
-            #active_idxs = set(np.intersect1d(seg, self.actives.indices))
-            active_idxs = set(self.actives.indices)
 
-            for syn_col in seg:
-                # Reward contributing synapses, punish others
-                if syn_col in active_idxs:
-                    # Actually apply later
-                    self.permanence_updates_buffer[0].append(perm_inc_step)
-                else:
-                    self.permanence_updates_buffer[0].append(-perm_dec_step)
-                self.permanence_updates_buffer[1].append(seg_linked)
-                self.permanence_updates_buffer[2].append(syn_col)
+            if len(seg) > 0:
+                # Find which synapses are connected to previously active cells
+                # Use array-based boolean checking against active_old_t which is dense/accessible
+                # Since we want to check if the synapse column was active in the previous step
+                # Actually, self.actives is the currently active ones (from previous step? yes, we haven't overwritten it yet)
+                active_idxs = set(self.actives.indices)
+
+                # Vectorized permanence update appends
+                for syn_col in seg:
+                    if syn_col in active_idxs:
+                        self.permanence_updates_buffer[0].append(perm_inc_step)
+                    else:
+                        self.permanence_updates_buffer[0].append(-perm_dec_step)
+                    self.permanence_updates_buffer[1].append(seg_linked)
+                    self.permanence_updates_buffer[2].append(syn_col)
 
             # Aim for specific number of potential synapses for winner segment
             new_syn_count = max_synapses_per_segment - (self.active_pot_counts[seg_linked] if not is_new_seg else 0)
@@ -269,17 +267,15 @@ class TemporalMemory(object):
                 existing_synapses = self.seg_matrix.indices[
                                     self.seg_matrix.indptr[seg_linked]:self.seg_matrix.indptr[seg_linked + 1]]
 
-                # Actives_old_perms contains permanence increase value for previously active cells
-                # and the decrease value for previously inactive
-                data = [self.actives_old_perms[idx] for idx in existing_synapses]
-                if log.has_trace():
+                if len(existing_synapses) > 0:
+                    # Actives_old_perms contains permanence increase value for previously active cells
+                    # and the decrease value for previously inactive
+                    # Use numpy indexing instead of list comprehension
+                    data = self.actives_old_perms[existing_synapses].tolist()
+                    self.permanence_updates_buffer[0].extend(data)
+                    self.permanence_updates_buffer[1].extend([seg_linked] * len(existing_synapses))
+                    self.permanence_updates_buffer[2].extend(existing_synapses.tolist())
 
-                    data_arr = np.array(data)
-
-                    log.trace("active seg has {} inc {} dec for {} synapses".format(len(data_arr[data_arr > 0]), len(data_arr[data_arr < 0]), len(existing_synapses)))
-                self.permanence_updates_buffer[0].extend(data)
-                self.permanence_updates_buffer[1].extend(len(existing_synapses) * [seg_linked])
-                self.permanence_updates_buffer[2].extend(existing_synapses)
                 new_syn_count = max_synapses_per_segment - self.active_pot_counts[seg_linked]
                 if new_syn_count:
                     self.grow_synapses(col, cell, seg_idx, new_syn_count)
@@ -316,15 +312,15 @@ class TemporalMemory(object):
         """
         Column was predicted to become active but didn't. Punish all synapses contributing to this prediction
         """
-        if learning_enabled:
+        if learning_enabled and perm_dec_predict_step > 0:
             for match_idx in self.get_matching_segs_for_col(col):
 
                 (c, cell, seg) = unflatten_segments(match_idx + (col * cells_per_col * max_segments_per_cell))
                 #assert c == col
                 seg_linked = self.seg_linkings[to_flat_segments(col, cell, seg)]
-                for idx in self.seg_matrix.indices[
-                           self.seg_matrix.indptr[seg_linked]: self.seg_matrix.indptr[
-                               seg_linked+1]]:
+
+                indices = self.seg_matrix.indices[self.seg_matrix.indptr[seg_linked]: self.seg_matrix.indptr[seg_linked+1]]
+                for idx in indices:
                     # Actives_old_t is CSC matrix of previously active cells (all in 1 row).
                     # If this and the next cell have the same indptr, there are no nonzero values in that column
                     # so it wasn't active. There are probably cleaner ways of doing this as efficiently.
@@ -339,11 +335,8 @@ class TemporalMemory(object):
         """
 
         # Broadcasting pointwise multiplication, contains permanences of synapses to active cells
-        global timer
-        t = time.time()
         active_synapses = self.seg_matrix.multiply(self.actives)[0:len(self.seg_linkings),:]
-        tt = time.time()
-        timer += tt-t
+
         connected_synapses = active_synapses.copy()  # Copy because we still need this version for potentials
         # Only considered connected if permanence is high enough
         connected_synapses.data[connected_synapses.data < connected_perm] = 0.0
@@ -360,8 +353,7 @@ class TemporalMemory(object):
         self.active_segs = conn_syns_counts_full.reshape((sp_size_flat, cells_per_col * max_segments_per_cell),
                                                                     order='C').tocsr()
 
-        #TEMP DEBUG CHECK
-        self.active_segs.eliminate_zeros() #TODO apparently the Falses are still in there. More efficient solution possible?
+        self.active_segs.eliminate_zeros()
         #print("Active seg count:", self.active_segs.data.shape)
         # finds = find(self.active_segs)
         # for i in range(finds[0].shape[0]):
@@ -413,9 +405,9 @@ class TemporalMemory(object):
         """
         if len(self.permanence_updates_buffer[0]):
             # COO for easy creation, to CSC for efficient addition
-            modder = csr_matrix((self.permanence_updates_buffer[0],
+            modder = coo_matrix((self.permanence_updates_buffer[0],
                                  (self.permanence_updates_buffer[1], self.permanence_updates_buffer[2])),
-                                shape=self.seg_matrix.shape)
+                                shape=self.seg_matrix.shape).tocsr()
 
             self.seg_matrix = (self.seg_matrix + modder)
 
@@ -426,14 +418,14 @@ class TemporalMemory(object):
         Grouped into one addition each for efficiency
         """
         if len(self.active_updates_buffer[0]):
-            #(data,indices,indptr)
-            self.actives = csr_matrix((self.active_updates_buffer[0],
-                                       self.active_updates_buffer[1], [0,len(self.active_updates_buffer[0])]),
-                                      shape=(1,tm_size_flat), dtype=bool)
+            # Use COO first then convert to avoid slow index checking in CSR
+            self.actives = coo_matrix((self.active_updates_buffer[0],
+                                       ([0]*len(self.active_updates_buffer[0]), self.active_updates_buffer[1])),
+                                      shape=(1,tm_size_flat), dtype=bool).tocsr()
         if len(self.winner_updates_buffer[0]):
-            self.winners = csr_matrix((self.winner_updates_buffer[0],
-                                       self.winner_updates_buffer[1], [0,len(self.winner_updates_buffer[0])]),
-                                      shape=(1,tm_size_flat), dtype=bool)
+            self.winners = coo_matrix((self.winner_updates_buffer[0],
+                                       ([0]*len(self.winner_updates_buffer[0]), self.winner_updates_buffer[1])),
+                                      shape=(1,tm_size_flat), dtype=bool).tocsr()
 
 
     def step_end(self):
@@ -441,17 +433,11 @@ class TemporalMemory(object):
         End-of-step bookkeeping. Move current matrices to their _old versions and reset them
         :return:
         """
-        global timera, timerb
-
         self.actives_old_t = self.actives.transpose().tocsr()
 
         dense_acts = self.actives.toarray()[0]
 
         self.actives_old_perms = np.where(dense_acts, perm_inc_step, -perm_dec_step)
-
-        #timerb += ttt - tt
-        #self.active_pot_counts_old = self.active_pot_counts
-        #self.active_pot_counts = csc_matrix((1, tm_size_flat[0] * max_segments_per_cell))
 
         self.permanence_updates_buffer = [[], [], []]
         self.winner_updates_buffer = [[], []]
@@ -495,7 +481,6 @@ class TemporalMemory(object):
 
         # Bookkeeping towards next step
         self.step_end()
-        global timera, timerb
-        print(timera, timerb)
+
         # self.actives is already reset to return the "old" actives
         return self.actives

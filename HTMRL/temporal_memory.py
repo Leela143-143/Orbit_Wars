@@ -476,10 +476,23 @@ class TemporalMemory(object):
         self.active_pot_counts = [0] * max_segs_total #dok_matrix((1, tm_size_flat[0] * max_segments_per_cell))
 
 
-    def step(self, activated_cols):
+    def step(self, activated_cols, reward=0.0):
         """
         The full step: from SP active columns to TM active cells
         """
+        # If learning with a continuous reward, scale the permanence updates
+        if reward != 0.0 and learning_enabled:
+            # Simple scaling function
+            active_scale = max(-1.0, min(1.0, reward))
+            dense_acts = self.actives.toarray()[0]
+            scaled_inc = perm_inc_step * active_scale
+            scaled_dec = perm_dec_step * active_scale
+
+            self.actives_old_perms = np.where(dense_acts, scaled_inc, -scaled_dec)
+            self._cached_scale = active_scale
+        else:
+            self._cached_scale = 1.0
+
         activated_set = set(activated_cols)
         for col in activated_cols:
             # For each active SP column, either...

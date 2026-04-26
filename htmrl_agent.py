@@ -20,8 +20,8 @@ def encoding_to_action(encoding, actions, sp_size):
 # My Ships: Size 1000, Active 25
 # 3 Planet Channels: 2000 size (50 active) = 6,000
 # 2 Fleet Channels: 4000 size (100 active) = 8,000
-# Total INPUT_SIZE = 15000
-INPUT_SIZE = 15000
+# Total INPUT_SIZE = 20000 (after adding velocity tracking)
+INPUT_SIZE = 20000
 
 class GlobalEmpireEncoder:
     def __init__(self):
@@ -29,10 +29,10 @@ class GlobalEmpireEncoder:
         # So we repurpose the first 1000 bits for "total empire ships"
         self.size = INPUT_SIZE
         self.empire_ships_encoder = ScalarEncoder(1000, 25, 0, 5000)
-        self.geo_planet_encoder = TileGeospatialEncoder(2000, 50, is_fleet=False)
-        self.geo_fleet_encoder = TileGeospatialEncoder(4000, 100, is_fleet=True)
+        self.geo_planet_encoder = TileGeospatialEncoder(3000, 75, is_fleet=False)
+        self.geo_fleet_encoder = TileGeospatialEncoder(5000, 125, is_fleet=True)
 
-    def encode(self, planets, fleets, player, center_x=500, center_y=500):
+    def encode(self, planets, fleets, player, velocity_map=None, center_x=50, center_y=50):
         state = np.zeros(self.size, dtype=bool)
         
         my_planets = [p for p in planets if p.owner == player]
@@ -49,15 +49,15 @@ class GlobalEmpireEncoder:
 
         # 2. Encode Top-K Unions relative to map center
         offset = 1000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, enemy_planets)
-        offset += 2000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, neutral_planets)
-        offset += 2000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, my_planets)
-        offset += 2000
-        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, enemy_fleets)
-        offset += 4000
-        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, friendly_fleets)
+        state[offset:offset+3000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, enemy_planets, velocity_map)
+        offset += 3000
+        state[offset:offset+3000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, neutral_planets, velocity_map)
+        offset += 3000
+        state[offset:offset+3000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, my_planets, velocity_map)
+        offset += 3000
+        state[offset:offset+5000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, enemy_fleets, velocity_map)
+        offset += 5000
+        state[offset:offset+5000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, friendly_fleets, velocity_map)
         
         return state
 def encoding_to_action(encoding, actions, sp_size):
@@ -89,6 +89,7 @@ class HTMRLAgent:
         self.tm_size = 2048 * 32
         self.last_actions = {}
         self.last_states = {}
+        self.planet_history = {} # Tracks previous planet positions to compute velocity
 
     def get_moves(self, obs, learn=False, reward=0):
         moves = []
@@ -102,22 +103,68 @@ class HTMRLAgent:
         
         if step == 0:
             self.tm.reset()
+            self.planet_history = {}
+            self.last_empire_value = 0.0
+            self.last_total_ships = 0
+            self.last_num_planets = 0
             
+        # Compute velocities for planets based on history
+        velocity_map = {}
+        for p in planets:
+            if p.id in self.planet_history:
+                old_x, old_y = self.planet_history[p.id]
+                velocity_map[p.id] = (p.x - old_x, p.y - old_y)
+            else:
+                velocity_map[p.id] = (0.0, 0.0)
+            self.planet_history[p.id] = (p.x, p.y)
+
         my_planets = [p for p in planets if p.owner == player]
+
+        # --- Biological Reward Calculation ---
+        my_ships = sum(p.ships for p in my_planets) + sum(f.ships for f in fleets if f.owner == player)
+        my_prod = sum(p.production for p in my_planets)
+
+        strongest_enemy_ships = 0
+        strongest_enemy_prod = 0
+        for e in range(1, 4):
+            if e == player: continue
+            e_ships = sum(p.ships for p in planets if p.owner == e) + sum(f.ships for f in fleets if f.owner == e)
+            e_prod = sum(p.production for p in planets if p.owner == e)
+            if e_ships > strongest_enemy_ships:
+                strongest_enemy_ships = e_ships
+                strongest_enemy_prod = e_prod
+
+        # Base Empire Value (Survival signal)
+        empire_value = (my_ships - strongest_enemy_ships) + 10 * (my_prod - strongest_enemy_prod)
+        continuous_reward = empire_value - getattr(self, 'last_empire_value', 0.0)
+        self.last_empire_value = empire_value
+
+        # Dopamine Hit (Captured a planet)
+        num_planets = len(my_planets)
+        if num_planets > getattr(self, 'last_num_planets', 0):
+            continuous_reward += 100.0 # Huge positive spike for conquering
+        self.last_num_planets = num_planets
+
+        # Pain Signal (Ships destroyed unexpectedly - void or sun)
+        # Production naturally adds `my_prod` ships per turn. If we lost more than we produced,
+        # and it wasn't due to combat (which affects empire_value), it's bad.
+        # Empire value mostly handles combat, but explicit pain for pure loss speeds up avoidance.
+        expected_ships = getattr(self, 'last_total_ships', 0) + my_prod
+        if step > 1 and my_ships < expected_ships:
+            # We lost ships. Check if it was a combat trade (enemy ships also dropped)
+            # If not combat, we hit the sun or void. Apply sharp penalty.
+            loss = expected_ships - my_ships
+            continuous_reward -= loss * 0.5
+
+        self.last_total_ships = my_ships
+        # --- End Reward Calculation ---
+
         if not my_planets:
             return moves
-
-        if learn and self.last_states:
-            # Simplistic reinforcement on the first state recorded
-            first_p_id = list(self.last_states.keys())[0]
-            action = self.last_actions[first_p_id]
-            state = self.last_states[first_p_id]
-            activated_cols = self.sp._get_activated_cols(state)
-            self.sp._reinf_buf = (state, activated_cols)
-            self.sp.reinforce(action, reward)
             
-        self.last_actions = {}
-        self.last_states = {}
+        # The SP runs continuously in unsupervised mode to build stable representations
+        if learn:
+            pass # The SP will learn its representation naturally during step()
 
         # The agent queries the map up to 10 times to form a strategy.
         # It updates its internal mock state of my_planets (ships left)
@@ -132,11 +179,11 @@ class HTMRLAgent:
 
         for query_idx in range(max_queries):
             # 1. Encode global state (this uses the un-mutated base state, which is fine for the single turn)
-            state = self.encoder.encode(planets, fleets, player)
+            state = self.encoder.encode(planets, fleets, player, velocity_map)
             
             # 2. Process through Spatial Pooler and Temporal Memory
-            sp_active_cols = self.sp.step(state, learn=False)
-            tm_actives = self.tm.step(sp_active_cols)
+            sp_active_cols = self.sp.step(state, learn=learn)
+            tm_actives = self.tm.step(sp_active_cols, reward=continuous_reward if learn else 0.0)
             
             # 3. Decode action
             if tm_actives.nnz > 0:
@@ -171,13 +218,12 @@ class HTMRLAgent:
                 
             moves.append([closest_planet.id, angle, ships_to_send])
 
+            # Metabolic cost: penalize sending ships very slightly to prevent pointless spam
+            if learn:
+                continuous_reward -= ships_to_send * 0.05
+
             # 6. Update internal mock state for next query in loop
             mutable_ships[closest_planet.id] -= ships_to_send
-
-            # Track state for potential learning
-            if query_idx == 0:
-                self.last_states[closest_planet.id] = state
-                self.last_actions[closest_planet.id] = 0
 
         return moves
 

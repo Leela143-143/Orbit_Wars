@@ -91,26 +91,50 @@ class SpatialPooler:
         return vals
 
     def _perms_to_activateds(self, perms_active):
+        # We can do this slightly faster by counting directly without intermediate large boolean array
+        # if performance allows, but np.sum is C-level
         with np.errstate(invalid='ignore'):
+            # Micro-optimization: use np.count_nonzero directly on boolean condition
+            # instead of creating boolean array then casting to float to sum
+            # Actually, perms_active > thresh is boolean, sum() works.
+            # However, since perms_active may have NaNs, > works cleanly and yields False for NaNs.
             connecteds = perms_active > self.connected_perm_thresh
 
         # Count the number of connected active input cells for each column
-        conn_counts = connecteds.sum(axis=0)
-        conn_counts = np.add(conn_counts, self._tie_breaker, casting='unsafe')
+        # perms_active is 2D (num_active_inputs x sp_size).
+        # We can sum along axis 0
+        conn_counts = np.sum(connecteds, axis=0, dtype=np.float32)
+        conn_counts += self._tie_breaker
 
         # Get the top-k columns in terms of connected active input cells
-        activated = np.argpartition(- conn_counts, self.active_columns_count)[:self.active_columns_count, ]
+        activated = np.argpartition(-conn_counts, self.active_columns_count)[:self.active_columns_count]
         return activated
 
     def _get_activated_cols(self, inputs):
         """
         Gets the indices of the activated columns
         """
-        active_perms = self.permanences[inputs]
-        if self.boost_strength:
-            active_perms = active_perms * self.boost_factors
+        # We only need the permanences of active inputs.
+        # inputs is a boolean array, we can use np.nonzero for fast indexing
+        # active_perms will be shape (num_active_inputs, self.size)
+        active_indices = np.nonzero(inputs)[0]
 
-        activated = self._perms_to_activateds(active_perms)
+        # Slicing the numpy array is very fast
+        active_perms = self.permanences[active_indices]
+
+        # Inline the counting logic to avoid multiple array allocations and function calls
+        with np.errstate(invalid='ignore'):
+            connecteds = active_perms > self.connected_perm_thresh
+
+        # Count the number of connected active input cells for each column
+        # sum along axis 0 drops us to 1D of size `self.size`
+        conn_counts = np.sum(connecteds, axis=0, dtype=np.float32)
+        conn_counts += self._tie_breaker
+
+        if self.boost_strength:
+            conn_counts *= self.boost_factors
+
+        activated = np.argpartition(-conn_counts, self.active_columns_count)[:self.active_columns_count]
 
         return activated
 
@@ -129,9 +153,11 @@ class SpatialPooler:
             inputs_shift *= reward
         # Reinforce only the synapses of the activated columns
         # impl: NaN + 1 == NaN, so all non-existing synapses don't get touched here
-        activated = [a for a in activated if action_range[0] <= a < action_range[1]]
-        # print("acts", activated, self.cells_per_act)
-        inactivated = [a for a in activated if not action_range[0] <= a < action_range[1]]
+        activated = np.asarray(activated)
+
+        mask = (activated >= action_range[0]) & (activated < action_range[1])
+        inactivated = activated[~mask]
+        activated = activated[mask]
 
         # update decaying coeffs
         if self.discount > 0.0:

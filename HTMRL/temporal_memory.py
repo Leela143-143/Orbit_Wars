@@ -145,18 +145,27 @@ class TemporalMemory(object):
         best_score = -1
         best_cell = None
         best_seg = None
-        #for idx in find(self.matching_segs_old[:, _from:_to])[1]:
-        for idx in self.matching_segs.indices[self.matching_segs.indptr[col]:self.matching_segs.indptr[col + 1]]:
-            (c, cell, seg_idx) = unflatten_segments(idx + (col * cells_per_col * max_segments_per_cell))
-            #assert c == col
-            full_idx = to_flat_segments(c, cell, seg_idx)
-            #assert full_idx == idx + (col * cells_per_col * max_segments_per_cell)
-            seg_linked = self.seg_linkings[full_idx]
-            this_score = self.active_pot_counts[seg_linked]
-            if this_score > best_score:
-                best_cell = cell
-                best_seg = seg_idx
-                best_score = this_score
+
+        col_offset = col * cells_per_col * max_segments_per_cell
+        indices = self.matching_segs.indices[self.matching_segs.indptr[col]:self.matching_segs.indptr[col + 1]]
+
+        for idx in indices:
+            # Inline unflatten to avoid function call overhead
+            flat = idx + col_offset
+            remain = flat % (cells_per_col * max_segments_per_cell)
+            cell = remain // max_segments_per_cell
+            seg_idx = remain % max_segments_per_cell
+
+            # Inline to_flat_segments
+            full_idx = col_offset + (cell * max_segments_per_cell) + seg_idx
+
+            seg_linked = self.seg_linkings.get(full_idx)
+            if seg_linked is not None:
+                this_score = self.active_pot_counts[seg_linked]
+                if this_score > best_score:
+                    best_cell = cell
+                    best_seg = seg_idx
+                    best_score = this_score
 
         return (best_cell, best_seg)
 
@@ -197,7 +206,9 @@ class TemporalMemory(object):
         self.active_updates_buffer[0].extend(cells_per_col * [True])
         self.active_updates_buffer[1].extend(list(range(_from, _to)))
         is_new_seg = False
-        if self.get_matching_segs_for_col_count(col):
+
+        # Micro-optimization: cache the call result
+        if self.matches_per_col[col]:
             # Winner cell is the one with the best matching segment...
             (winner_cell, learning_seg) = self.get_best_matching_seg(col)
         else:
@@ -333,9 +344,12 @@ class TemporalMemory(object):
         """
         Calculate the matching and active segments, for use in the next step
         """
+        # Truncate seg matrix to actual size instead of doing it after multiply
+        # This drastically speeds up the multiply
+        actual_seg_matrix = self.seg_matrix[:len(self.seg_linkings)]
 
         # Broadcasting pointwise multiplication, contains permanences of synapses to active cells
-        active_synapses = self.seg_matrix.multiply(self.actives)[0:len(self.seg_linkings),:]
+        active_synapses = actual_seg_matrix.multiply(self.actives)
 
         connected_synapses = active_synapses.copy()  # Copy because we still need this version for potentials
         # Only considered connected if permanence is high enough
@@ -404,12 +418,13 @@ class TemporalMemory(object):
         Grouped into one addition for efficiency
         """
         if len(self.permanence_updates_buffer[0]):
-            # COO for easy creation, to CSC for efficient addition
+            # Use actual sum_duplicates on COO instead of naive addition
+            # This is significantly faster for overlapping modifications
             modder = coo_matrix((self.permanence_updates_buffer[0],
                                  (self.permanence_updates_buffer[1], self.permanence_updates_buffer[2])),
-                                shape=self.seg_matrix.shape).tocsr()
-
-            self.seg_matrix = (self.seg_matrix + modder)
+                                shape=self.seg_matrix.shape)
+            modder.sum_duplicates()
+            self.seg_matrix = self.seg_matrix + modder.tocsr()
 
 
     def update_actives_and_winners(self):
@@ -418,13 +433,22 @@ class TemporalMemory(object):
         Grouped into one addition each for efficiency
         """
         if len(self.active_updates_buffer[0]):
-            # Use COO first then convert to avoid slow index checking in CSR
+            # Directly construct CSR since row is always 0
+            n_items = len(self.active_updates_buffer[0])
+            # For a 1-row CSR matrix:
+            # indptr is [0, n_items], indices are the column indices, data is the values
+            # However, we must ensure columns are sorted and unique for standard behavior.
+            # Using COO -> CSR handles this perfectly in C.
+            # Micro-opt: use np.zeros for the row indices.
+            rows = np.zeros(n_items, dtype=np.int32)
             self.actives = coo_matrix((self.active_updates_buffer[0],
-                                       ([0]*len(self.active_updates_buffer[0]), self.active_updates_buffer[1])),
+                                       (rows, self.active_updates_buffer[1])),
                                       shape=(1,tm_size_flat), dtype=bool).tocsr()
         if len(self.winner_updates_buffer[0]):
+            n_items = len(self.winner_updates_buffer[0])
+            rows = np.zeros(n_items, dtype=np.int32)
             self.winners = coo_matrix((self.winner_updates_buffer[0],
-                                       ([0]*len(self.winner_updates_buffer[0]), self.winner_updates_buffer[1])),
+                                       (rows, self.winner_updates_buffer[1])),
                                       shape=(1,tm_size_flat), dtype=bool).tocsr()
 
 
@@ -466,10 +490,11 @@ class TemporalMemory(object):
                 # ...or burst all cells
                 self.burst(col)
 
-        matching_cols = np.nonzero(self.matches_per_col)[0]
-        for col in matching_cols:
-            if col not in activated_set:
-                self.punish_predicted(col)
+        if perm_dec_predict_step > 0:
+            matching_cols = np.nonzero(self.matches_per_col)[0]
+            for col in matching_cols:
+                if col not in activated_set:
+                    self.punish_predicted(col)
 
         # The previous steps generated lists of updates to perform to the synapses and active/winner cells,
         # but they still have to be actually applied to the sparse matrices

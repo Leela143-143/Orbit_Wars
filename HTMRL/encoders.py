@@ -22,6 +22,19 @@ class ScalarEncoder:
         state[bucket : bucket + self.active_bits] = True
         return state
 
+    def encode_batch_indices(self, values):
+        """Returns the flat indices that would be true for an array of values"""
+        values = np.asarray(values)
+        v = np.clip(values, self.min_val, self.max_val)
+        buckets = ((v - self.min_val) / self.range * (self.buckets - 1)).astype(np.int32)
+        buckets = np.clip(buckets, 0, self.buckets - 1)
+
+        # Create an array of offsets
+        offsets = np.arange(self.active_bits)
+        # Broadcasting to create a 2D array of indices: [num_values, active_bits]
+        indices = buckets[:, None] + offsets
+        return indices
+
 class CyclicEncoder:
     """
     Encodes an angle/cyclic value into an overlapping SDR.
@@ -44,6 +57,21 @@ class CyclicEncoder:
             idx = (center_idx - half_active + i) % self.size
             state[idx] = True
         return state
+
+    def encode_batch_indices(self, values):
+        """Returns the flat indices that would be true for an array of values"""
+        values = np.asarray(values)
+        norm_vals = ((values - self.min_val) % self.range) / self.range
+        norm_vals[norm_vals < 0] += 1.0
+
+        center_idxs = (norm_vals * self.size).astype(np.int32)
+        half_active = self.active_bits // 2
+
+        # Create an array of offsets
+        offsets = np.arange(self.active_bits) - half_active
+        # Broadcasting to create a 2D array of indices: [num_values, active_bits]
+        indices = (center_idxs[:, None] + offsets) % self.size
+        return indices
 
 class TileGeospatialEncoder:
     def __init__(self, size=3000, active_bits=75, is_fleet=False):
@@ -96,43 +124,68 @@ class TileGeospatialEncoder:
     def encode_union_topk(self, origin_x, origin_y, targets, velocity_map=None):
         float_state = np.zeros(self.size, dtype=np.float32)
 
+        if not targets:
+            return np.zeros(self.size, dtype=bool)
+
         if velocity_map is None:
             velocity_map = {}
 
-        for target in targets:
-            dx = target.x - origin_x
-            dy = target.y - origin_y
+        # Vectorize target properties
+        target_ids = [t.id for t in targets]
+        t_x = np.array([t.x for t in targets])
+        t_y = np.array([t.y for t in targets])
 
-            # Check if target has an explicit heading (fleets have angle)
-            heading = getattr(target, 'angle', None)
-            speed = 0.0
+        dx = t_x - origin_x
+        dy = t_y - origin_y
 
-            # If no explicit heading, check if we calculated its velocity (for orbiting planets)
-            if heading is None and target.id in velocity_map:
-                vx, vy = velocity_map[target.id]
-                if vx != 0 or vy != 0:
-                    heading = math.atan2(vy, vx)
-                    if heading < 0:
-                        heading += 2 * math.pi
-                    speed = math.sqrt(vx**2 + vy**2)
-            elif heading is None:
-                heading = 0.0
+        dists = np.hypot(dx, dy)
+        angles = np.arctan2(dy, dx)
+        angles[angles < 0] += 2 * math.pi
 
-            if self.is_fleet:
-                speed = getattr(target, 'ships', 0) # Placeholder proxy for speed scaling logic if needed, actual speed depends on game state.
+        weights = 1.0 / (1.0 + dists)
 
-            dist = math.sqrt(dx**2 + dy**2)
-            weight = 1.0 / (1.0 + dist)
+        if self.is_fleet:
+            headings = np.array([t.angle for t in targets])
+            speeds = np.array([t.ships for t in targets]) # Proxy for speed
 
-            sdr = self.encode(dx, dy, heading, speed)
-            float_state[sdr] += weight
+            # Batch encode
+            angle_idx = self.angle_encoder.encode_batch_indices(angles)
+            dist_idx = self.dist_encoder.encode_batch_indices(dists) + 1000
+
+            angle_shifted = (angles + math.pi) % (2*math.pi)
+            angle_phase_idx = self.angle_encoder_phase.encode_batch_indices(angle_shifted) + 2000
+            heading_idx = self.heading_encoder.encode_batch_indices(headings) + 3000
+            speed_idx = self.speed_encoder.encode_batch_indices(speeds) + 4000
+
+            all_indices = np.concatenate((angle_idx, dist_idx, angle_phase_idx, heading_idx, speed_idx), axis=1)
+
+        else:
+            headings = np.zeros(len(targets))
+            for i, tid in enumerate(target_ids):
+                if tid in velocity_map:
+                    vx, vy = velocity_map[tid]
+                    if vx != 0 or vy != 0:
+                        h = math.atan2(vy, vx)
+                        headings[i] = h if h >= 0 else h + 2 * math.pi
+
+            # Batch encode
+            angle_idx = self.angle_encoder.encode_batch_indices(angles)
+            dist_idx = self.dist_encoder.encode_batch_indices(dists) + 1000
+            heading_idx = self.heading_encoder.encode_batch_indices(headings) + 2000
+
+            all_indices = np.concatenate((angle_idx, dist_idx, heading_idx), axis=1)
+
+        # Accumulate weights into float_state
+        # all_indices is shape [num_targets, num_active_bits]
+        # weights is shape [num_targets]
+        for i in range(len(targets)):
+            float_state[all_indices[i]] += weights[i]
 
         final_state = np.zeros(self.size, dtype=bool)
-        if len(targets) > 0:
-            non_zero_count = np.count_nonzero(float_state)
-            k = min(self.active_bits, non_zero_count)
-            if k > 0:
-                top_k_indices = np.argpartition(float_state, -k)[-k:]
-                final_state[top_k_indices] = True
+        non_zero_count = np.count_nonzero(float_state)
+        k = min(self.active_bits, non_zero_count)
+        if k > 0:
+            top_k_indices = np.argpartition(float_state, -k)[-k:]
+            final_state[top_k_indices] = True
 
         return final_state

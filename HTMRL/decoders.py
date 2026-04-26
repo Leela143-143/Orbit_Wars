@@ -59,32 +59,40 @@ def action_decode(encoding_indices, sp_size, num_cells=None):
     which have length sp_size * cells_per_col, or Spatial Pooler indices).
 
     If indices are from TM, we map them back to SP columns first.
-    Then we split the SP columns into an angle portion and a ship portion.
+    Then we split the SP columns into a target coordinates portion, an angle portion and a ship portion.
     """
     if num_cells is not None:
-        # Map TM cells back to SP columns
-        # tm_size = sp_size * cells_per_col
-        # column_idx = cell_idx // cells_per_col
         columns = indices_to_columns(encoding_indices, num_cells)
     else:
         columns = np.array(encoding_indices)
 
-    # Assuming SP output size is e.g. 200 bits total for action
-    # First half = Angle, Second half = Ships %
-    half_size = sp_size // 2
+    # Split the SP columns into 4 portions:
+    # 1. Target Planet Selection X (0 to 1000)
+    # 2. Target Planet Selection Y (0 to 1000)
+    # 3. Action Angle (0 to 2pi)
+    # 4. Ships % (0 to 1)
+    quarter_size = sp_size // 4
 
-    angle_cols = columns[columns < half_size]
-    ship_cols = columns[columns >= half_size] - half_size
+    target_x_cols = columns[columns < quarter_size]
+    target_y_cols = columns[(columns >= quarter_size) & (columns < 2*quarter_size)] - quarter_size
+    angle_cols = columns[(columns >= 2*quarter_size) & (columns < 3*quarter_size)] - 2*quarter_size
+    ship_cols = columns[columns >= 3*quarter_size] - 3*quarter_size
 
-    # We decode Angle to 0 -> 2pi
-    angle_decoder = ReverseCyclicDecoder(half_size, 0, 2*math.pi)
+    # Decode Target Selection (assume map size max 1000 for x and y bounds, Kaggle orbit wars is generally bounded)
+    target_x_decoder = ReverseScalarDecoder(quarter_size, 0.0, 1000.0)
+    target_y_decoder = ReverseScalarDecoder(quarter_size, 0.0, 1000.0)
+    target_x = target_x_decoder.decode(target_x_cols)
+    target_y = target_y_decoder.decode(target_y_cols)
+
+    # Decode Action Angle
+    angle_decoder = ReverseCyclicDecoder(quarter_size, 0, 2*math.pi)
     angle = angle_decoder.decode(angle_cols)
 
-    # We decode Ship % to 0 -> 100% (or fraction 0 -> 1)
-    ship_decoder = ReverseScalarDecoder(half_size, 0.0, 1.0)
+    # Decode Ship %
+    ship_decoder = ReverseScalarDecoder(quarter_size, 0.0, 1.0)
     ship_pct = ship_decoder.decode(ship_cols)
 
-    return angle, ship_pct
+    return target_x, target_y, angle, ship_pct
 
 def indices_to_columns(tm_indices, cells_per_col):
     cols = np.array(tm_indices) // cells_per_col

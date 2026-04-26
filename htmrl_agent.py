@@ -23,38 +23,41 @@ def encoding_to_action(encoding, actions, sp_size):
 # Total INPUT_SIZE = 15000
 INPUT_SIZE = 15000
 
-class OrbitWarsEncoder:
+class GlobalEmpireEncoder:
     def __init__(self):
+        # We don't have "my_planet.ships" anymore since we encode globally
+        # So we repurpose the first 1000 bits for "total empire ships"
         self.size = INPUT_SIZE
-        self.ships_encoder = ScalarEncoder(1000, 25, 0, 500)
+        self.empire_ships_encoder = ScalarEncoder(1000, 25, 0, 5000)
         self.geo_planet_encoder = TileGeospatialEncoder(2000, 50, is_fleet=False)
         self.geo_fleet_encoder = TileGeospatialEncoder(4000, 100, is_fleet=True)
 
-    def encode(self, my_planet, planets, fleets, player):
+    def encode(self, planets, fleets, player, center_x=500, center_y=500):
         state = np.zeros(self.size, dtype=bool)
         
-        # 1. My ships
-        state[0:1000] = self.ships_encoder.encode(my_planet.ships)
-
-        # 2. Separate entities
-        enemy_planets = [p for p in planets if p.owner != player and p.owner != -1 and p.id != my_planet.id]
-        neutral_planets = [p for p in planets if p.owner == -1 and p.id != my_planet.id]
-        friendly_planets = [p for p in planets if p.owner == player and p.id != my_planet.id]
+        my_planets = [p for p in planets if p.owner == player]
+        enemy_planets = [p for p in planets if p.owner != player and p.owner != -1]
+        neutral_planets = [p for p in planets if p.owner == -1]
 
         enemy_fleets = [f for f in fleets if f.owner != player]
         friendly_fleets = [f for f in fleets if f.owner == player]
 
-        # 3. Encode Top-K Unions
+        total_ships = sum(p.ships for p in my_planets) + sum(f.ships for f in friendly_fleets)
+
+        # 1. Total empire ships
+        state[0:1000] = self.empire_ships_encoder.encode(total_ships)
+
+        # 2. Encode Top-K Unions relative to map center
         offset = 1000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, enemy_planets)
         offset += 2000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, neutral_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, neutral_planets)
         offset += 2000
-        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_planets)
+        state[offset:offset+2000] = self.geo_planet_encoder.encode_union_topk(center_x, center_y, my_planets)
         offset += 2000
-        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(my_planet.x, my_planet.y, enemy_fleets)
+        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, enemy_fleets)
         offset += 4000
-        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(my_planet.x, my_planet.y, friendly_fleets)
+        state[offset:offset+4000] = self.geo_fleet_encoder.encode_union_topk(center_x, center_y, friendly_fleets)
         
         return state
 def encoding_to_action(encoding, actions, sp_size):
@@ -65,7 +68,7 @@ def encoding_to_action(encoding, actions, sp_size):
 
 class HTMRLAgent:
     def __init__(self, load_path=None):
-        self.encoder = OrbitWarsEncoder()
+        self.encoder = GlobalEmpireEncoder()
         if load_path and os.path.exists(load_path):
             with open(load_path, "rb") as f:
                 data = pickle.load(f)
@@ -97,30 +100,18 @@ class HTMRLAgent:
         from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet
         fleets = [Fleet(*f) for f in raw_fleets]
         
-        # Clear local timeline memory when a new match starts
         if step == 0:
             self.tm.reset()
             
         my_planets = [p for p in planets if p.owner == player]
-        enemies = [p for p in planets if p.owner != player and p.owner != -1]
-        neutrals = [p for p in planets if p.owner == -1]
-        
-        # If learning, we can reinforce based on the total reward change
-        # Wait, the SP reinforce takes action and reward. But we have multiple actions (one per planet).
-        # We can just reinforce all actions taken in the last step with the same global reward.
-        # But SpatialPooler in HTMRL only stores a single `_reinf_buf`.
-        # To handle multiple planets, we should ideally have one SP or reinforce multiple times.
-        # For simplicity, if learn=True, we reinforce the FIRST action taken.
-        # Or better, we only use HTMRL for a SINGLE main planet's decision?
-        # Let's reinforce the SP with the last state and action of one planet.
-        
+        if not my_planets:
+            return moves
+
         if learn and self.last_states:
-            # We just reinforce based on the first recorded state
+            # Simplistic reinforcement on the first state recorded
             first_p_id = list(self.last_states.keys())[0]
             action = self.last_actions[first_p_id]
             state = self.last_states[first_p_id]
-            
-            # Manually set reinf_buf and reinforce
             activated_cols = self.sp._get_activated_cols(state)
             self.sp._reinf_buf = (state, activated_cols)
             self.sp.reinforce(action, reward)
@@ -128,32 +119,66 @@ class HTMRLAgent:
         self.last_actions = {}
         self.last_states = {}
 
-        for mine in my_planets:
-            state = self.encoder.encode(mine, planets, fleets, player)
-            sp_active_cols = self.sp.step(state, learn=False) # We'll do manual learning above
+        # The agent queries the map up to 10 times to form a strategy.
+        # It updates its internal mock state of my_planets (ships left)
+        # to ensure it doesn't double-spend ships.
+        acted_planets = set()
+
+        # Max moves bounded by smaller of 10 or number of owned planets
+        max_queries = min(10, len(my_planets))
+
+        # Create a mutable proxy for tracking ships since kaggle environment namedtuples are immutable
+        mutable_ships = {p.id: p.ships for p in my_planets}
+
+        for query_idx in range(max_queries):
+            # 1. Encode global state (this uses the un-mutated base state, which is fine for the single turn)
+            state = self.encoder.encode(planets, fleets, player)
             
-            # STEP TM
+            # 2. Process through Spatial Pooler and Temporal Memory
+            sp_active_cols = self.sp.step(state, learn=False)
             tm_actives = self.tm.step(sp_active_cols)
             
+            # 3. Decode action
             if tm_actives.nnz > 0:
-                angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
+                target_x, target_y, angle, ship_pct = action_decode(tm_actives.indices, self.sp.size, num_cells=32)
             else:
-                angle, ship_pct = action_decode(sp_active_cols, self.sp.size, num_cells=None)
+                target_x, target_y, angle, ship_pct = action_decode(sp_active_cols, self.sp.size, num_cells=None)
             
-            self.last_states[mine.id] = state
-            self.last_actions[mine.id] = 0  # Reverted to 0 since action space is continuous and spatial pooler uses acts_n=1
-            
-            if ship_pct < 0.1 or mine.ships == 0:
-                continue
+            if ship_pct < 0.1:
+                # Agent decided not to act anymore
+                break
 
-            ships = int(mine.ships * ship_pct)
-            if ships == 0:
+            # 4. Find the closest un-acted planet to the target coordinates
+            closest_planet = None
+            closest_dist = float('inf')
+            for p in my_planets:
+                if p.id in acted_planets or mutable_ships[p.id] == 0:
+                    continue
+                dist = math.hypot(p.x - target_x, p.y - target_y)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_planet = p
+
+            if not closest_planet:
+                break
+
+            acted_planets.add(closest_planet.id)
+            
+            # 5. Form the move
+            ships_to_send = int(mutable_ships[closest_planet.id] * ship_pct)
+            if ships_to_send == 0:
                 continue
                 
-            moves.append([mine.id, angle, ships])
+            moves.append([closest_planet.id, angle, ships_to_send])
 
+            # 6. Update internal mock state for next query in loop
+            mutable_ships[closest_planet.id] -= ships_to_send
 
-                
+            # Track state for potential learning
+            if query_idx == 0:
+                self.last_states[closest_planet.id] = state
+                self.last_actions[closest_planet.id] = 0
+
         return moves
 
 _cached_agents = {}
